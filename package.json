@@ -1,0 +1,43 @@
+{
+  "name": "gsd-python-script-runner-production",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1022.0",
+    "@kubernetes/client-node": "^1.4.0",
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
+    "aws-sdk": "^2.1693.0",
+    "axios": "^1.14.0",
+    "bullmq": "^5.71.1",
+    "child_process": "^1.0.2",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "fs-extra": "^11.3.4",
+    "ioredis": "^5.10.1",
+    "mongoose": "^9.3.3",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  },
+  "nodemonConfig": {
+    "watch": [
+      "src"
+    ],
+    "ignore": [
+      "runtime/*",
+      "storage/*",
+      "local-storage/*"
+    ]
+  }
+}
