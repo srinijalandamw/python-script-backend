@@ -18,6 +18,15 @@ storage/
 executions/
 outputs/
 
+#Python
+__pycache__/
+*.pyc
+
+#Docker
+*.tar
+
+test-scripts/
+
 
 # Runtime temp files
 runtime/jobs/

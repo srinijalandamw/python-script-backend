@@ -1,66 +1,184 @@
 /**
  * ============================================================
- * 📦 SCRIPT DOWNLOAD ROUTE (PRODUCTION SAFE - EXPRESS v5 FIXED)
+ * 📦 SCRIPT ROUTES (UPLOAD + EXECUTION)
  * ============================================================
  *
- * ✅ No wildcard routes (avoids path-to-regexp crash)
- * ✅ Works in Express v5+
- * ✅ Supports nested paths
- * ✅ Used by Kubernetes pods to download script.zip
+ * This file handles:
+ * 1. Uploading script ZIP to S3
+ * 2. Triggering execution (K8s job)
+ *
+ * Acts as entry point for:
+ * Client / Postman → Backend → Execution Service
  */
 
 const express = require("express");
 const router = express.Router();
 
+/**
+ * 📦 File upload middleware
+ * - multer stores file in memory (buffer)
+ * - we directly send buffer to S3
+ */
+const multer = require("multer");
+const upload = multer();
+
+/**
+ * 📦 Storage abstraction
+ * - uploadFile → S3
+ * - (future: can switch providers easily)
+ */
 const storage = require("../utils/storage");
 
 /**
- * 🚀 Middleware to serve script files
- *
- * Example request:
- * GET /scripts/scripts/<scriptId>/<version>/script.zip
+ * 📦 DB model
+ * - stores script metadata
  */
-router.use("/scripts", async (req, res) => {
+const ScriptVersion = require("../models/scriptVersion.model");
+
+/**
+ * 🚀 Execution service
+ * - creates execution entry
+ * - triggers Kubernetes job
+ */
+const executionService = require("../services/execution.service");
+
+/**
+ * ============================================================
+ * 📤 UPLOAD SCRIPT TO S3
+ * ============================================================
+ *
+ * Endpoint:
+ * POST /scripts/upload
+ *
+ * Body (form-data):
+ * - file (script.zip)
+ * - scriptId
+ * - version
+ *
+ * Flow:
+ * file → buffer → S3 → DB (ScriptVersion)
+ */
+router.post("/upload", upload.single("file"), async (req, res) => {
   try {
-    // ============================================================
-    // 🔥 EXTRACT FULL STORAGE KEY
-    // ============================================================
+    const { scriptId, version } = req.body;
 
-    // originalUrl = /scripts/scripts/65f.../1.0/script.zip
-    const fullUrl = req.originalUrl;
-
-    // remove "/scripts/" prefix
-    const key = fullUrl.replace(/^\/scripts\//, "");
-
-    console.log("📥 Serving script from storage:", key);
-
-    // ============================================================
-    // 📥 READ FROM STORAGE (LOCAL / S3)
-    // ============================================================
-
-    const fileBuffer = await storage.readFile(key);
-
-    if (!fileBuffer || fileBuffer.length === 0) {
-      console.error("❌ Script not found or empty:", key);
-      return res.status(404).send("Script not found");
+    /**
+     * 🔍 Validate input
+     */
+    if (!req.file) {
+      return res.status(400).json({ error: "File missing" });
     }
 
-    // ============================================================
-    // 📤 SEND FILE TO CLIENT (K8s POD)
-    // ============================================================
+    if (!scriptId || !version) {
+      return res.status(400).json({ error: "scriptId and version required" });
+    }
 
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader(
-      "Content-Disposition",
-      "attachment; filename=script.zip"
+    /**
+     * 📁 Construct S3 path
+     *
+     * IMPORTANT:
+     * This must match what K8s will use later
+     */
+    const key = `scripts/${scriptId}/${version}/script.zip`;
+
+    console.log("📦 Uploading script to S3:", key);
+
+    /**
+     * ☁️ Upload to S3
+     */
+    await storage.uploadFile(key, req.file.buffer);
+
+    /**
+     * 🗄️ Store metadata in DB
+     */
+    await ScriptVersion.create({
+      scriptId,
+      version,
+      storageKey: key,
+      entrypoint: "main.py", // default (can be dynamic later)
+      inputSchema: {},
+    });
+
+    return res.json({
+      message: "Script uploaded successfully",
+      storageKey: key,
+    });
+
+  } catch (err) {
+    console.error("❌ Upload error:", err.message);
+
+    return res.status(500).json({
+      error: "Upload failed",
+      details: err.message,
+    });
+  }
+});
+
+/**
+ * ============================================================
+ * 🚀 EXECUTE SCRIPT
+ * ============================================================
+ *
+ * Endpoint:
+ * POST /scripts/:scriptId/:version/execute
+ *
+ * Body:
+ * JSON input for script
+ *
+ * Flow:
+ * API → ExecutionService → Mongo → K8s Job
+ */
+router.post("/:scriptId/:version/execute", async (req, res) => {
+  try {
+    const { scriptId, version } = req.params;
+    const inputData = req.body;
+
+    console.log("⚡ Execution trigger received");
+    console.log("Script:", scriptId, "Version:", version);
+
+    /**
+     * 🚀 Create execution
+     * - stores in Mongo
+     * - generates processId
+     * - triggers Kubernetes job
+     */
+    const execution = await executionService.createExecution(
+      scriptId,
+      version,
+      inputData,
+      null // userId (can be added later)
     );
 
-    return res.send(fileBuffer);
+    /**
+     * 📤 Response to client
+     */
+    return res.status(201).json({
+      success: true,
+      message: "Execution started",
+      executionId: execution._id,
+      processId: execution.processId,
+      status: execution.status,
+    });
 
-  } catch (error) {
-    console.error("❌ Script route error:", error.message);
-    return res.status(500).send("Internal Server Error");
+  } catch (err) {
+    console.error("❌ Execution error:", err.message);
+
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
   }
+});
+
+/**
+ * ============================================================
+ * 📥 HEALTH CHECK (OPTIONAL)
+ * ============================================================
+ */
+router.get("/", (req, res) => {
+  res.json({
+    message: "Script service is running",
+  });
 });
 
 module.exports = router;

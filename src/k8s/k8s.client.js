@@ -1,106 +1,225 @@
 /**
- * ☸️ KUBERNETES CLIENT (FINAL PRODUCTION)
- *THIS IS USED TO CREATE KUBERNETES JOBS
- * 🔥 KEY FEATURES:
- * - Single reusable base image
- * - Dynamic script execution
- * - Safe curl (fails if bad zip)
- * - Proper working directory (/app)
- * - Input injection via ENV
+ * ============================================================
+ * ☸️ KUBERNETES EXECUTION CLIENT (FINAL PRODUCTION)
+ * ============================================================
  */
 
 const k8s = require("@kubernetes/client-node");
 
+/**
+ * ============================================================
+ * LOAD CONFIG
+ * ============================================================
+ */
 const kc = new k8s.KubeConfig();
 
 if (process.env.KUBERNETES_SERVICE_HOST) {
+  console.log("☸️ Using in-cluster Kubernetes config");
   kc.loadFromCluster();
 } else {
+  console.log("☸️ Using local kubeconfig");
   kc.loadFromDefault();
 }
 
 const batchV1 = kc.makeApiClient(k8s.BatchV1Api);
 
 /**
- * 🚀 CREATE JOB - RESPOINSIBLE FOR CREATING THE JOB IN THE KUBERNETES 
+ * ============================================================
+ * NAMESPACE VALIDATION
+ * ============================================================
  */
-async function createJob(executionId, scriptPath, input = {}) {
-  const namespace = process.env.K8S_NAMESPACE || "default";
+function getNamespace() {
+  const ns = process.env.K8S_NAMESPACE;
 
-  const jobName = `job-${executionId}`;
+  if (!ns || typeof ns !== "string" || !ns.trim()) {
+    throw new Error("❌ K8S_NAMESPACE is missing or invalid");
+  }
 
-  console.log("☸️ Creating Job:", jobName);
+  return ns.trim();
+}
 
-  const jobManifest = {
-    apiVersion: "batch/v1",
-    kind: "Job",
-    metadata: { name: jobName },
+/**
+ * ============================================================
+ * SAFE JOB NAME
+ * ============================================================
+ */
+function sanitizeJobName(name) {
+  return String(name)
+    .toLowerCase()
+    .replace(/_/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .slice(0, 63);
+}
 
-    spec: {
-      template: {
-        spec: {
-          restartPolicy: "Never",
+/**
+ * ============================================================
+ * 🚀 CREATE JOB
+ * ============================================================
+ */
+async function createJob(processId, scriptUrl, input = {}) {
+  try {
+    const ns = getNamespace();
+    const jobName = sanitizeJobName(processId);
 
-          containers: [
-            {
-              name: "runner",
-              image: "python:3.10",
-              imagePullPolicy: "IfNotPresent",
+    console.log("☸️ FINAL NS USED:", ns);
+    console.log("🚀 JOB NAME:", jobName);
 
-              env: [
-                {
-                  name: "INPUT_JSON",
-                  value: JSON.stringify(input || {}),
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+
+      metadata: {
+        name: jobName,
+        labels: {
+          app: "gsd-script-runner",
+        },
+      },
+
+      spec: {
+        backoffLimit: 0,
+        ttlSecondsAfterFinished: 300,
+
+        template: {
+          metadata: {
+            labels: {
+              app: "gsd-script-runner",
+              job: jobName,
+            },
+          },
+
+          spec: {
+            restartPolicy: "Never",
+
+            /**
+             * 🔐 OPTIONAL (ONLY IF PRIVATE DOCKER REPO)
+             */
+            // imagePullSecrets: [
+            //   {
+            //     name: "dockerhub-secret",
+            //   },
+            // ],
+
+            containers: [
+              {
+                name: "runner",
+
+                /**
+                 * 🚀 YOUR OPTIMIZED IMAGE
+                 */
+                image: "monicab2026/gsd-python-runner:latest",
+
+                /**
+                 * 🔥 CRITICAL FIX
+                 */
+                imagePullPolicy: "Always",
+
+                env: [
+                  {
+                    name: "INPUT_JSON",
+                    value: JSON.stringify(input || {}),
+                  },
+                  {
+                    name: "SCRIPT_URL",
+                    value: scriptUrl,
+                  },
+                ],
+
+                resources: {
+                  requests: {
+                    cpu: "100m",
+                    memory: "128Mi",
+                  },
+                  limits: {
+                    cpu: "500m",
+                    memory: "512Mi",
+                  },
                 },
-              ],
 
-              command: ["sh", "-c"],
+                command: ["sh", "-c"],
 
-              args: [
-                `
-set -e  # 🔥 FAIL FAST
+                args: [
+                  `
+set -e
 
-echo "🚀 Container started"
+echo "🚀 STARTING EXECUTION"
 
-mkdir -p /app
-cd /app
-
-echo "📦 Installing system deps..."
-apt update && apt install -y unzip curl
+mkdir -p /app && cd /app
 
 echo "📥 Downloading script..."
-curl -f -o script.zip http://host.minikube.internal:3000/scripts/${scriptPath}
+curl -f -o script.zip "$SCRIPT_URL"
 
-echo "📂 Unzipping..."
+echo "📦 Extracting..."
 unzip script.zip
 
-echo "🧾 Creating input.json..."
-echo "$INPUT_JSON" > /app/input.json
+echo "$INPUT_JSON" > input.json
 
-echo "📦 Installing Python deps..."
 if [ -f requirements.txt ]; then
+  echo "📦 Installing dependencies..."
   pip install -r requirements.txt
 fi
 
 echo "▶️ Running script..."
+
 python main.py
 
-echo "📤 Execution completed"
-                `,
-              ],
-            },
-          ],
+echo "✅ DONE"
+                  `,
+                ],
+              },
+            ],
+          },
         },
       },
+    };
 
-      backoffLimit: 0,
-    },
-  };
+    /**
+     * 🔥 SAFE API CALL
+     */
+    const response = await batchV1.createNamespacedJob({
+      namespace: ns,
+      body: jobManifest,
+    });
 
-  return batchV1.createNamespacedJob({
-    namespace,
-    body: jobManifest,
-  });
+    console.log("✅ JOB CREATED:", jobName);
+
+    return response.body;
+  } catch (err) {
+    console.error("❌ CREATE JOB FAILED:");
+    console.error(err.body || err.message);
+    throw err;
+  }
 }
 
-module.exports = { createJob };
+/**
+ * ============================================================
+ * 🧹 DELETE JOB
+ * ============================================================
+ */
+async function deleteJob(processId) {
+  try {
+    const ns = getNamespace();
+    const jobName = sanitizeJobName(processId);
+
+    console.log("🧹 Deleting Job:", jobName);
+
+    await batchV1.deleteNamespacedJob(
+      jobName,
+      ns,
+      undefined,
+      undefined,
+      0,
+      false,
+      "Foreground"
+    );
+
+    console.log("✅ Job deleted:", jobName);
+  } catch (err) {
+    console.error("❌ deleteJob failed:");
+    console.error(err.body || err.message);
+  }
+}
+
+module.exports = {
+  createJob,
+  deleteJob,
+};

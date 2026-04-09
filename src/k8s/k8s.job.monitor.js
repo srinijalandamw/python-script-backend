@@ -1,13 +1,11 @@
-/* Polls Kubernetes
-Gets logs
-Extracts output
-Stores output
-Updates MongoDB 
-*/
-
+/**
+ * ============================================================
+ * 🚀 PRODUCTION K8S REAL-TIME MONITOR (FINAL STABLE)
+ * ============================================================
+ */
 
 const k8s = require("@kubernetes/client-node");
-const Execution = require("../modules/executions/execution.model");
+const Execution = require("../models/execution.model");
 const { storeOutput } = require("../utils/storage");
 
 const kc = new k8s.KubeConfig();
@@ -18,161 +16,261 @@ if (process.env.KUBERNETES_SERVICE_HOST) {
   kc.loadFromDefault();
 }
 
-const batchV1 = kc.makeApiClient(k8s.BatchV1Api);
+const watch = new k8s.Watch(kc);
 const coreV1 = kc.makeApiClient(k8s.CoreV1Api);
 
-const NAMESPACE = "default";
+/**
+ * ✅ SAFE NAMESPACE
+ */
+function getNamespace() {
+  const ns = process.env.K8S_NAMESPACE;
+  if (!ns || !ns.trim()) {
+    throw new Error("❌ K8S_NAMESPACE missing");
+  }
+  return ns.trim();
+}
 
-function startJobMonitor() {
-  console.log("📡 K8s Job Monitor started...");
+const NAMESPACE = getNamespace();
 
-  setInterval(async () => {
-    try {
-      console.log("🔍 Checking K8s job status...");
+/**
+ * 🧠 STATE TRACKING
+ */
+const activeStreams = new Set();
+const completedPods = new Set();
 
-      const res = await batchV1.listNamespacedJob({
-        namespace: NAMESPACE,
-      });
+/**
+ * 🚀 START MONITOR
+ */
+function startRealTimeMonitor() {
+  console.log("🚀 Kubernetes REAL-TIME monitor started...");
 
-      const jobs = res?.items || [];
+  watch.watch(
+    `/api/v1/namespaces/${NAMESPACE}/pods`,
+    {}, // 🔥 DO NOT FILTER HERE (we filter manually)
 
-      for (const job of jobs) {
-        try {
-          const jobName = job?.metadata?.name;
-          const jobStatus = job?.status || {};
+    async (type, pod) => {
+      try {
+        const podName = pod.metadata?.name;
+        const jobName = pod.metadata?.labels?.job;
 
-          if (!jobName) continue;
+        if (!podName || !jobName) return;
 
-          const executionId = jobName.replace("job-", "");
+        /**
+         * 🔥 ONLY HANDLE OUR JOBS
+         */
+        if (!jobName.startsWith("job-")) return;
 
-          const execution = await Execution.findById(executionId);
-          if (!execution) continue;
+        console.log(`📡 Pod Event: ${type} → ${podName}`);
 
-          // ✅ prevent reprocessing
-          if (["SUCCESS", "FAILED", "PROCESSING"].includes(execution.status)) {
-            continue;
-          }
+        /**
+         * 🟢 STREAM LOGS (SAFE)
+         */
+        const isRunning =
+          pod.status?.containerStatuses?.[0]?.state?.running;
 
-          // =========================
-          // ✅ SUCCESS
-          // =========================
-          if (jobStatus.succeeded) {
-            console.log(`✅ Job completed: ${jobName}`);
+        if (isRunning && !activeStreams.has(podName)) {
+          activeStreams.add(podName);
+          safeStreamLogs(podName);
+        }
 
-            // 🔒 LOCK
-            const locked = await Execution.findOneAndUpdate(
-              { _id: executionId, status: { $ne: "SUCCESS" } },
-              { status: "PROCESSING" }
-            );
+        /**
+         * 🔴 COMPLETION HANDLER
+         */
+        const phase = pod.status?.phase;
 
-            if (!locked) continue;
+        if (
+          (phase === "Succeeded" || phase === "Failed") &&
+          !completedPods.has(podName)
+        ) {
+          completedPods.add(podName);
 
-            const podName = await getPodName(jobName);
-            const logs = await getPodLogs(podName);
+          console.log("🔥 Handling completion:", podName);
 
-            const output = extractOutputFromLogs(logs);
+          await handleCompletion(podName, jobName, phase);
+        }
+      } catch (err) {
+        console.error("❌ Watch error:", err.message);
+      }
+    },
 
-            let storageKey = null;
+    (err) => {
+      console.error("❌ Watch crashed:", err);
+      setTimeout(startRealTimeMonitor, 5000);
+    }
+  );
+}
 
-            if (output) {
-              console.log("📦 Storing output...");
-              storageKey = await storeOutput(executionId, output);
-            } else {
-              console.log("⚠️ No output found in logs");
-            }
+/**
+ * 📡 SAFE LOG STREAM (NO CRASH)
+ */
+function safeStreamLogs(podName) {
+  const log = new k8s.Log(kc);
 
-            await Execution.findByIdAndUpdate(executionId, {
-              status: "SUCCESS",
-              finishedAt: new Date(),
-              logs: logs.map((l) => ({ message: l })),
-              outputs: output?.outputs || [],
-              outputStorageKey: storageKey,
-            });
-
-            continue;
-          }
-
-          // =========================
-          // ❌ FAILED
-          // =========================
-          if (jobStatus.failed) {
-            console.log(`❌ Job failed: ${jobName}`);
-
-            const podName = await getPodName(jobName);
-            const logs = await getPodLogs(podName);
-
-            await Execution.findByIdAndUpdate(executionId, {
-              status: "FAILED",
-              finishedAt: new Date(),
-              logs: logs.map((l) => ({ message: l })),
-            });
-
-            continue;
-          }
-        } catch (err) {
-          console.error(`❌ Error for job ${job?.metadata?.name}:`, err.message);
+  try {
+    log.log(
+      NAMESPACE,
+      podName,
+      "runner",
+      process.stdout,
+      {
+        follow: true,
+        pretty: false,
+      },
+      (err) => {
+        if (err) {
+          console.warn("⚠️ Stream closed:", podName);
         }
       }
-    } catch (err) {
-      console.error("❌ Monitor Error:", err.message);
-    }
-  }, 5000);
-}
-
-/**
- * 📦 GET POD NAME
- */
-async function getPodName(jobName) {
-  const res = await coreV1.listNamespacedPod({
-    namespace: NAMESPACE,
-    labelSelector: `job-name=${jobName}`,
-  });
-
-  return res?.items?.[0]?.metadata?.name;
-}
-
-/**
- * 📥 GET POD LOGS
- */
-async function getPodLogs(podName) {
-  try {
-    if (!podName) return [];
-
-    const logRes = await coreV1.readNamespacedPodLog({
-      name: podName,
-      namespace: NAMESPACE,
-    });
-
-    return logRes.split("\n").filter((l) => l.trim() !== "");
+    );
   } catch (err) {
-    console.error("⚠️ Log fetch failed:", err.message);
-    return [];
+    console.warn("⚠️ Stream failed:", err.message);
   }
 }
 
 /**
- * 🔥 EXTRACT OUTPUT JSON
+ * 🔥 HANDLE COMPLETION (PRODUCTION SAFE)
  */
-function extractOutputFromLogs(logs) {
+async function handleCompletion(podName, jobName, phase) {
   try {
-    const start = logs.findIndex((l) => l.includes("OUTPUT_JSON_START"));
-    const end = logs.findIndex((l) => l.includes("OUTPUT_JSON_END"));
+    /**
+     * 🟢 EARLY STATUS UPDATE (CRITICAL FIX)
+     * This ensures Mongo is updated instantly when job completes
+     */
+    const finalStatus = phase === "Succeeded" ? "SUCCESS" : "FAILED";
+
+    await Execution.findOneAndUpdate(
+      { processId: jobName },
+      {
+        status: finalStatus,
+        finishedAt: new Date(),
+      }
+    );
+
+    console.log("⚡ Early Mongo update done:", jobName);
+
+    /**
+     * ⏳ RETRY LOG FETCH (POD MAY TERMINATE FAST)
+     */
+    let logs = [];
+
+    for (let i = 0; i < 5; i++) {
+      try {
+        const res = await coreV1.readNamespacedPodLog({
+          name: podName,
+          namespace: NAMESPACE,
+        });
+
+        logs = res.split("\n").filter(Boolean);
+
+        if (logs.length > 0) break;
+      } catch (err) {
+        await sleep(1000);
+      }
+    }
+
+    console.log(`📜 Final logs fetched: ${logs.length}`);
+
+    /**
+     * 💾 SAVE LOGS
+     */
+    await Execution.findOneAndUpdate(
+      { processId: jobName },
+      {
+        logs: logs.map((l) => ({
+          message: l,
+          createdAt: new Date(),
+        })),
+      }
+    );
+
+    /**
+     * 📦 EXTRACT OUTPUT
+     */
+    const output = extractOutput(logs);
+
+    let outputKey = null;
+
+    if (output) {
+      outputKey = `executions/${jobName}/output.json`;
+
+      console.log("📦 Uploading output to S3...");
+
+      await storeOutput(
+        outputKey,
+        Buffer.from(JSON.stringify(output, null, 2))
+      );
+    }
+
+    /**
+     * 🟢 FINAL PATCH UPDATE (NO STATUS TOUCH)
+     * Only attach output key (do NOT overwrite status again)
+     */
+    await Execution.findOneAndUpdate(
+      { processId: jobName },
+      {
+        outputStorageKey: outputKey,
+      }
+    );
+
+    console.log("🎉 Mongo fully updated for:", jobName);
+  } catch (err) {
+    console.error("❌ Completion failed:", err.message);
+  }
+}
+
+
+/**
+ * 🔥 ROBUST OUTPUT PARSER (FINAL FIX)
+ */
+function extractOutput(logs) {
+  try {
+    const starts = [];
+    const ends = [];
+
+    logs.forEach((l, i) => {
+      if (l.includes("OUTPUT_JSON_START")) starts.push(i);
+      if (l.includes("OUTPUT_JSON_END")) ends.push(i);
+    });
+
+    if (!starts.length || !ends.length) return null;
+
+    let start = -1;
+    let end = -1;
+
+    for (let i = starts.length - 1; i >= 0; i--) {
+      const s = starts[i];
+      const e = ends.find((ei) => ei > s);
+
+      if (e) {
+        start = s;
+        end = e;
+        break;
+      }
+    }
 
     if (start === -1 || end === -1) return null;
 
-    const jsonString = logs.slice(start + 1, end).join("");
+    const raw = logs.slice(start + 1, end).join("").trim();
 
-    const parsed = JSON.parse(jsonString);
+    const firstBrace = raw.indexOf("{");
+    if (firstBrace === -1) return null;
 
-    console.log("✅ Output JSON extracted");
+    const clean = raw.slice(firstBrace);
 
-    return parsed;
+    return JSON.parse(clean);
   } catch (err) {
-    console.error("⚠️ Output parse failed:", err.message);
+    console.error("❌ Output parse error:", err.message);
     return null;
   }
 }
 
+/**
+ * 💤 UTILS
+ */
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
 module.exports = {
-  startJobMonitor,
+  startRealTimeMonitor,
 };
