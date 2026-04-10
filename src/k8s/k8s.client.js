@@ -1,16 +1,16 @@
 /**
- * ============================================================
- * ☸️ KUBERNETES EXECUTION CLIENT (FINAL PRODUCTION)
- * ============================================================
- */
+* ============================================================
+* ☸️ KUBERNETES EXECUTION CLIENT (FINAL PRODUCTION FIXED)
+* ============================================================
+*/
 
 const k8s = require("@kubernetes/client-node");
 
 /**
- * ============================================================
- * LOAD CONFIG
- * ============================================================
- */
+* ============================================================
+* LOAD CONFIG
+* ============================================================
+*/
 const kc = new k8s.KubeConfig();
 
 if (process.env.KUBERNETES_SERVICE_HOST) {
@@ -24,10 +24,10 @@ if (process.env.KUBERNETES_SERVICE_HOST) {
 const batchV1 = kc.makeApiClient(k8s.BatchV1Api);
 
 /**
- * ============================================================
- * NAMESPACE VALIDATION
- * ============================================================
- */
+* ============================================================
+* NAMESPACE VALIDATION
+* ============================================================
+*/
 function getNamespace() {
   const ns = process.env.K8S_NAMESPACE;
 
@@ -39,23 +39,24 @@ function getNamespace() {
 }
 
 /**
- * ============================================================
- * SAFE JOB NAME
- * ============================================================
- */
+* ============================================================
+* SAFE JOB NAME
+* ============================================================
+*/
 function sanitizeJobName(name) {
   return String(name)
     .toLowerCase()
     .replace(/_/g, "-")
     .replace(/[^a-z0-9-]/g, "")
+    .replace(/^-+|-+$/g, "")
     .slice(0, 63);
 }
 
 /**
- * ============================================================
- * 🚀 CREATE JOB
- * ============================================================
- */
+* ============================================================
+* 🚀 CREATE JOB
+* ============================================================
+*/
 async function createJob(processId, scriptUrl, input = {}) {
   try {
     const ns = getNamespace();
@@ -67,18 +68,15 @@ async function createJob(processId, scriptUrl, input = {}) {
     const jobManifest = {
       apiVersion: "batch/v1",
       kind: "Job",
-
       metadata: {
         name: jobName,
         labels: {
           app: "gsd-script-runner",
         },
       },
-
       spec: {
         backoffLimit: 0,
         ttlSecondsAfterFinished: 300,
-
         template: {
           metadata: {
             labels: {
@@ -86,32 +84,13 @@ async function createJob(processId, scriptUrl, input = {}) {
               job: jobName,
             },
           },
-
           spec: {
             restartPolicy: "Never",
-
-            /**
-             * 🔐 OPTIONAL (ONLY IF PRIVATE DOCKER REPO)
-             */
-            // imagePullSecrets: [
-            //   {
-            //     name: "dockerhub-secret",
-            //   },
-            // ],
-
             containers: [
               {
                 name: "runner",
-
-                /**
-                 * 🚀 YOUR OPTIMIZED IMAGE
-                 */
                 image: "monicab2026/gsd-python-runner:latest",
-
-                /**
-                 * 🔥 CRITICAL FIX
-                 */
-                imagePullPolicy: "Always",
+                imagePullPolicy: "IfNotPresent",
 
                 env: [
                   {
@@ -136,7 +115,6 @@ async function createJob(processId, scriptUrl, input = {}) {
                 },
 
                 command: ["sh", "-c"],
-
                 args: [
                   `
 set -e
@@ -159,7 +137,6 @@ if [ -f requirements.txt ]; then
 fi
 
 echo "▶️ Running script..."
-
 python main.py
 
 echo "✅ DONE"
@@ -173,28 +150,31 @@ echo "✅ DONE"
     };
 
     /**
-     * 🔥 SAFE API CALL
+     * ============================================================
+     * 🔥 FIXED K8S CALL (IMPORTANT CHANGE)
+     * ============================================================
      */
-    const response = await batchV1.createNamespacedJob({
-      namespace: ns,
-      body: jobManifest,
-    });
+
+    const response = await batchV1.createNamespacedJob(
+      ns,
+      jobManifest
+    );
 
     console.log("✅ JOB CREATED:", jobName);
 
     return response.body;
   } catch (err) {
     console.error("❌ CREATE JOB FAILED:");
-    console.error(err.body || err.message);
+    console.error(err.body || err.response?.body || err.message);
     throw err;
   }
 }
 
 /**
- * ============================================================
- * 🧹 DELETE JOB
- * ============================================================
- */
+* ============================================================
+* 🧹 DELETE JOB
+* ============================================================
+*/
 async function deleteJob(processId) {
   try {
     const ns = getNamespace();
@@ -215,7 +195,7 @@ async function deleteJob(processId) {
     console.log("✅ Job deleted:", jobName);
   } catch (err) {
     console.error("❌ deleteJob failed:");
-    console.error(err.body || err.message);
+    console.error(err.body || err.response?.body || err.message);
   }
 }
 

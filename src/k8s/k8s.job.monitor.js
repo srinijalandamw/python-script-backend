@@ -46,18 +46,13 @@ function startRealTimeMonitor() {
 
   watch.watch(
     `/api/v1/namespaces/${NAMESPACE}/pods`,
-    {}, // 🔥 DO NOT FILTER HERE (we filter manually)
-
+    {},
     async (type, pod) => {
       try {
         const podName = pod.metadata?.name;
         const jobName = pod.metadata?.labels?.job;
 
         if (!podName || !jobName) return;
-
-        /**
-         * 🔥 ONLY HANDLE OUR JOBS
-         */
         if (!jobName.startsWith("job-")) return;
 
         console.log(`📡 Pod Event: ${type} → ${podName}`);
@@ -92,7 +87,6 @@ function startRealTimeMonitor() {
         console.error("❌ Watch error:", err.message);
       }
     },
-
     (err) => {
       console.error("❌ Watch crashed:", err);
       setTimeout(startRealTimeMonitor, 5000);
@@ -128,16 +122,15 @@ function safeStreamLogs(podName) {
 }
 
 /**
- * 🔥 HANDLE COMPLETION (PRODUCTION SAFE)
+ * 🔥 HANDLE COMPLETION (FIXED LOG FETCH ONLY)
  */
 async function handleCompletion(podName, jobName, phase) {
   try {
-    /**
-     * 🟢 EARLY STATUS UPDATE (CRITICAL FIX)
-     * This ensures Mongo is updated instantly when job completes
-     */
     const finalStatus = phase === "Succeeded" ? "SUCCESS" : "FAILED";
 
+    /**
+     * 🟢 EARLY STATUS UPDATE
+     */
     await Execution.findOneAndUpdate(
       { processId: jobName },
       {
@@ -149,18 +142,21 @@ async function handleCompletion(podName, jobName, phase) {
     console.log("⚡ Early Mongo update done:", jobName);
 
     /**
-     * ⏳ RETRY LOG FETCH (POD MAY TERMINATE FAST)
+     * ⏳ RETRY LOG FETCH (FIXED API USAGE)
      */
     let logs = [];
 
     for (let i = 0; i < 5; i++) {
       try {
-        const res = await coreV1.readNamespacedPodLog({
-          name: podName,
-          namespace: NAMESPACE,
-        });
+        const res = await coreV1.readNamespacedPodLog(
+          podName,
+          NAMESPACE,
+          "runner"
+        );
 
-        logs = res.split("\n").filter(Boolean);
+        const raw = (res?.body || res || "").toString();
+
+        logs = raw.split("\n").filter(Boolean);
 
         if (logs.length > 0) break;
       } catch (err) {
@@ -171,7 +167,7 @@ async function handleCompletion(podName, jobName, phase) {
     console.log(`📜 Final logs fetched: ${logs.length}`);
 
     /**
-     * 💾 SAVE LOGS
+     * 💾 SAVE LOGS (FIXED STRUCTURE)
      */
     await Execution.findOneAndUpdate(
       { processId: jobName },
@@ -202,8 +198,7 @@ async function handleCompletion(podName, jobName, phase) {
     }
 
     /**
-     * 🟢 FINAL PATCH UPDATE (NO STATUS TOUCH)
-     * Only attach output key (do NOT overwrite status again)
+     * 🟢 FINAL PATCH UPDATE
      */
     await Execution.findOneAndUpdate(
       { processId: jobName },
@@ -213,14 +208,14 @@ async function handleCompletion(podName, jobName, phase) {
     );
 
     console.log("🎉 Mongo fully updated for:", jobName);
+
   } catch (err) {
     console.error("❌ Completion failed:", err.message);
   }
 }
 
-
 /**
- * 🔥 ROBUST OUTPUT PARSER (FINAL FIX)
+ * 🔥 ROBUST OUTPUT PARSER (UNCHANGED BUT SAFE)
  */
 function extractOutput(logs) {
   try {
@@ -251,13 +246,12 @@ function extractOutput(logs) {
     if (start === -1 || end === -1) return null;
 
     const raw = logs.slice(start + 1, end).join("").trim();
-
     const firstBrace = raw.indexOf("{");
+
     if (firstBrace === -1) return null;
 
-    const clean = raw.slice(firstBrace);
+    return JSON.parse(raw.slice(firstBrace));
 
-    return JSON.parse(clean);
   } catch (err) {
     console.error("❌ Output parse error:", err.message);
     return null;
