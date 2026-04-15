@@ -1,11 +1,11 @@
 /**
  * ============================================================
- * 🚀 PRODUCTION K8S REAL-TIME MONITOR (FINAL STABLE)
+ * 🚀 PRODUCTION K8S REAL-TIME MONITOR (NATIVE MONGODB VERSION)
  * ============================================================
  */
 
 const k8s = require("@kubernetes/client-node");
-const Execution = require("../models/execution.model");
+const { getDB } = require("../config/db.config");
 const { storeOutput } = require("../utils/storage");
 
 const kc = new k8s.KubeConfig();
@@ -58,7 +58,7 @@ function startRealTimeMonitor() {
         console.log(`📡 Pod Event: ${type} → ${podName}`);
 
         /**
-         * 🟢 STREAM LOGS (SAFE)
+         * 🟢 STREAM LOGS
          */
         const isRunning =
           pod.status?.containerStatuses?.[0]?.state?.running;
@@ -95,7 +95,7 @@ function startRealTimeMonitor() {
 }
 
 /**
- * 📡 SAFE LOG STREAM (NO CRASH)
+ * 📡 SAFE LOG STREAM
  */
 function safeStreamLogs(podName) {
   const log = new k8s.Log(kc);
@@ -122,27 +122,32 @@ function safeStreamLogs(podName) {
 }
 
 /**
- * 🔥 HANDLE COMPLETION (FIXED LOG FETCH ONLY)
+ * 🔥 HANDLE COMPLETION
  */
 async function handleCompletion(podName, jobName, phase) {
   try {
+    const db = getDB();
+    const executions = db.collection("executions");
+
     const finalStatus = phase === "Succeeded" ? "SUCCESS" : "FAILED";
 
     /**
      * 🟢 EARLY STATUS UPDATE
      */
-    await Execution.findOneAndUpdate(
+    await executions.updateOne(
       { processId: jobName },
       {
-        status: finalStatus,
-        finishedAt: new Date(),
+        $set: {
+          status: finalStatus,
+          finishedAt: new Date(),
+        },
       }
     );
 
     console.log("⚡ Early Mongo update done:", jobName);
 
     /**
-     * ⏳ RETRY LOG FETCH (FIXED API USAGE)
+     * ⏳ RETRY LOG FETCH
      */
     let logs = [];
 
@@ -167,15 +172,17 @@ async function handleCompletion(podName, jobName, phase) {
     console.log(`📜 Final logs fetched: ${logs.length}`);
 
     /**
-     * 💾 SAVE LOGS (FIXED STRUCTURE)
+     * 💾 SAVE LOGS
      */
-    await Execution.findOneAndUpdate(
+    await executions.updateOne(
       { processId: jobName },
       {
-        logs: logs.map((l) => ({
-          message: l,
-          createdAt: new Date(),
-        })),
+        $set: {
+          logs: logs.map((l) => ({
+            message: l,
+            createdAt: new Date(),
+          })),
+        },
       }
     );
 
@@ -198,12 +205,14 @@ async function handleCompletion(podName, jobName, phase) {
     }
 
     /**
-     * 🟢 FINAL PATCH UPDATE
+     * 🟢 FINAL UPDATE
      */
-    await Execution.findOneAndUpdate(
+    await executions.updateOne(
       { processId: jobName },
       {
-        outputStorageKey: outputKey,
+        $set: {
+          outputStorageKey: outputKey,
+        },
       }
     );
 
@@ -215,7 +224,7 @@ async function handleCompletion(podName, jobName, phase) {
 }
 
 /**
- * 🔥 ROBUST OUTPUT PARSER (UNCHANGED BUT SAFE)
+ * 🔍 OUTPUT PARSER
  */
 function extractOutput(logs) {
   try {
@@ -258,9 +267,6 @@ function extractOutput(logs) {
   }
 }
 
-/**
- * 💤 UTILS
- */
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
@@ -268,3 +274,4 @@ function sleep(ms) {
 module.exports = {
   startRealTimeMonitor,
 };
+

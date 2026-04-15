@@ -1,21 +1,34 @@
+// src/config/db.config.js
 
+const { MongoClient } = require("mongodb");
 
-//This db.config.js file is to connect the project with mongoDB
-//Whenever the server calls it , establishes the connection
-
-
-
-
-const mongoose = require("mongoose");
+let client;
+let db;
 
 const connectDB = async () => {
   try {
-    await mongoose.connect(process.env.MONGO_URI);
-    console.log("🔌 DB Connected inside db.config");
+    client = new MongoClient(process.env.MONGO_URI);
+    await client.connect();
+
+    db = client.db(); // default DB from URI
+
+    console.log("🔌 MongoDB Connected (Native Driver)");
+
+    return db;
   } catch (err) {
-    console.error("DB Error:", err.message);
+    console.error("❌ DB Connection Error:", err.message);
     process.exit(1);
   }
 };
 
-module.exports = connectDB;
+const getDB = () => {
+  if (!db) {
+    throw new Error("❌ DB not initialized. Call connectDB first.");
+  }
+  return db;
+};
+
+module.exports = {
+  connectDB,
+  getDB,
+};

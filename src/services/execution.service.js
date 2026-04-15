@@ -1,22 +1,21 @@
 /**
- * 🚀 EXECUTION SERVICE (KUBERNETES + S3 + PROCESS ID BASED)
+ * 🚀 EXECUTION SERVICE (FINAL - NATIVE MONGO + K8s)
  *
  * RESPONSIBILITIES:
- * - Create execution record
- * - Generate processId (job name)
- * - Fetch script from DB
- * - Generate S3 signed URL
+ * - Create execution record (Mongo)
+ * - Generate processId
+ * - Fetch script version (Mongo)
+ * - Generate signed S3 URL
  * - Trigger Kubernetes Job
  */
 
-const Execution = require("../models/execution.model");
-const ScriptVersion = require("../models/scriptVersion.model");
+const { ObjectId } = require("mongodb");
+const { getDB } = require("../config/db.config"); // 🔥 IMPORTANT
 const { createJob } = require("../k8s/k8s.client");
-const { getSignedFileUrl } = require("../utils/storage/s3"); // must exist
+const { getSignedFileUrl } = require("../utils/storage/s3");
 
 /**
  * 🧠 GENERATE PROCESS ID
- * Format: job-<executionId>
  */
 function generateProcessId(executionId) {
   return `job-${executionId}`;
@@ -24,86 +23,153 @@ function generateProcessId(executionId) {
 
 class ExecutionService {
   /**
-   * 🚀 CREATE EXECUTION ENTRY
+   * 🚀 CREATE EXECUTION
    */
   async createExecution(scriptId, version, input = {}, userId) {
-    /**
-     * 1. Create execution in DB
-     */
-    const execution = await Execution.create({
-      scriptId,
-      version,
-      input,
-      createdBy: userId,
-      status: "PENDING",
-    });
+    try {
+      const db = getDB();
 
-    /**
-     * 2. Generate processId
-     */
-    const processId = generateProcessId(execution._id);
+      if (!db) {
+        throw new Error("❌ DB not initialized");
+      }
 
-    execution.processId = processId;
-    await execution.save();
+      const executionsCollection = db.collection("executions");
+      const scriptVersionsCollection = db.collection("scriptversions");
 
-    console.log("🆔 Process ID generated:", processId);
+      /**
+       * ============================================================
+       * 1️⃣ CREATE EXECUTION ENTRY
+       * ============================================================
+       */
+      const executionDoc = {
+        scriptId: new ObjectId(scriptId),
+        version,
+        input,
+        status: "PENDING",
+        logs: [],
+        outputStorageKey: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        startedAt: null,
+        finishedAt: null,
+        processId: null,
+        createdBy: userId || "system",
+      };
 
-    /**
-     * 3. Fetch script version from DB
-     */
-    const scriptVersion = await ScriptVersion.findOne({
-      scriptId,
-      version,
-      isActive: true,
-    });
+      const insertResult = await executionsCollection.insertOne(executionDoc);
 
-    if (!scriptVersion) {
-      throw new Error("Script version not found");
+      const executionId = insertResult.insertedId;
+
+      /**
+       * ============================================================
+       * 2️⃣ GENERATE PROCESS ID
+       * ============================================================
+       */
+      const processId = generateProcessId(executionId);
+
+      await executionsCollection.updateOne(
+        { _id: executionId },
+        {
+          $set: {
+            processId,
+          },
+        }
+      );
+
+      console.log("🆔 Process ID:", processId);
+
+      /**
+       * ============================================================
+       * 3️⃣ FETCH SCRIPT VERSION (🔥 FIXED OBJECTID MATCH)
+       * ============================================================
+       */
+      const scriptVersion = await scriptVersionsCollection.findOne({
+        scriptId: new ObjectId(scriptId),
+        version,
+        isActive: true,
+      });
+
+      if (!scriptVersion) {
+        throw new Error("❌ Script version not found");
+      }
+
+      console.log("✅ Script version found");
+
+      /**
+       * ============================================================
+       * 4️⃣ GENERATE SIGNED URL
+       * ============================================================
+       */
+      const scriptUrl = await getSignedFileUrl(
+        scriptVersion.storageKey
+      );
+
+      console.log("🔐 Signed URL generated");
+
+      /**
+       * ============================================================
+       * 5️⃣ TRIGGER K8s JOB
+       * ============================================================
+       */
+      await createJob(processId, scriptUrl, input);
+
+      console.log("🚀 K8s job triggered");
+
+      /**
+       * ============================================================
+       * 6️⃣ UPDATE STATUS → RUNNING
+       * ============================================================
+       */
+      await executionsCollection.updateOne(
+        { _id: executionId },
+        {
+          $set: {
+            status: "RUNNING",
+            startedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      console.log("🔥 Execution running:", processId);
+
+      /**
+       * ============================================================
+       * 7️⃣ RETURN RESPONSE
+       * ============================================================
+       */
+      return {
+        _id: executionId,
+        processId,
+        status: "RUNNING",
+      };
+
+    } catch (err) {
+      console.error("❌ ExecutionService Error:", err.message);
+      throw err;
     }
-
-    /**
-     * 4. Generate S3 signed URL (PRIVATE BUCKET)
-     */
-    const scriptUrl = await getSignedFileUrl(
-      scriptVersion.storageKey
-    );
-
-    console.log("🔐 Signed URL generated");
-
-    /**
-     * 5. Trigger Kubernetes Job
-     */
-    await createJob(
-      processId,
-      scriptUrl,
-      input,
-    );
-
-    /**
-     * 6. Update execution → RUNNING
-     */
-    execution.status = "RUNNING";
-    execution.startedAt = new Date();
-
-    await execution.save();
-
-    console.log("🚀 Execution started:", processId);
-
-    return execution;
   }
 
   /**
    * 📄 GET EXECUTION BY ID
    */
   async getExecution(executionId) {
-    return Execution.findById(executionId);
+    const db = getDB();
+    return db.collection("executions").findOne({
+      _id: new ObjectId(executionId),
+    });
   }
 
   /**
-   * 📋 GET ALL EXECUTIONS (OPTIONAL)
+   * 📋 GET ALL EXECUTIONS
    */
   async getAllExecutions() {
-    return Execution.find().sort({ createdAt: -1 });
+    const db = getDB();
+    return db
+      .collection("executions")
+      .find()
+      .sort({ createdAt: -1 })
+      .toArray();
   }
 }
 
