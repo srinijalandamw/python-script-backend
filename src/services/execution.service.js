@@ -1,89 +1,70 @@
 /**
- * 🚀 EXECUTION SERVICE (FINAL - NATIVE MONGO + K8s)
- *
- * RESPONSIBILITIES:
- * - Create execution record (Mongo)
- * - Generate processId
- * - Fetch script version (Mongo)
- * - Generate signed S3 URL
- * - Trigger Kubernetes Job
+ * 🚀 EXECUTION SERVICE (FINAL - TRITON + K8s ALIGNED)
  */
 
 const { ObjectId } = require("mongodb");
-const { getDB } = require("../config/db.config"); // 🔥 IMPORTANT
+const { getDB } = require("../config/db.config");
 const { createJob } = require("../k8s/k8s.client");
 const { getSignedFileUrl } = require("../utils/storage/s3");
 
-/**
- * 🧠 GENERATE PROCESS ID
- */
 function generateProcessId(executionId) {
-  return `job-${executionId}`;
+  return `gsd-py-runner-job-${executionId}`;
 }
 
 class ExecutionService {
-  /**
-   * 🚀 CREATE EXECUTION
-   */
   async createExecution(scriptId, version, input = {}, userId) {
     try {
       const db = getDB();
+      if (!db) throw new Error("❌ DB not initialized");
 
-      if (!db) {
-        throw new Error("❌ DB not initialized");
-      }
-
-      const executionsCollection = db.collection("executions");
-      const scriptVersionsCollection = db.collection("scriptversions");
+      const executions = db.collection("executions");
+      const scriptVersions = db.collection("scriptversions");
 
       /**
-       * ============================================================
-       * 1️⃣ CREATE EXECUTION ENTRY
-       * ============================================================
+       * 1️⃣ CREATE EXECUTION
        */
       const executionDoc = {
         scriptId: new ObjectId(scriptId),
         version,
-        input,
+        inputs: input,
+
         status: "PENDING",
         logs: [],
+
+        //output: null,
         outputStorageKey: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
+        logsStorageKey: null, // ✅ NEW
+
+        processId: null,
+
         startedAt: null,
         finishedAt: null,
-        processId: null,
-        createdBy: userId || "system",
+
+        createdAt: new Date(),
+        updatedAt: new Date(),
+
+        executedBy: userId || "system",
       };
 
-      const insertResult = await executionsCollection.insertOne(executionDoc);
-
+      const insertResult = await executions.insertOne(executionDoc);
       const executionId = insertResult.insertedId;
 
       /**
-       * ============================================================
-       * 2️⃣ GENERATE PROCESS ID
-       * ============================================================
+       * 2️⃣ PROCESS ID
        */
       const processId = generateProcessId(executionId);
 
-      await executionsCollection.updateOne(
+      await executions.updateOne(
         { _id: executionId },
-        {
-          $set: {
-            processId,
-          },
-        }
+        { $set: { processId } }
       );
 
       console.log("🆔 Process ID:", processId);
 
       /**
-       * ============================================================
-       * 3️⃣ FETCH SCRIPT VERSION (🔥 FIXED OBJECTID MATCH)
-       * ============================================================
+       * 3️⃣ FETCH SCRIPT VERSION
        */
-      const scriptVersion = await scriptVersionsCollection.findOne({
+      const scriptVersion = await scriptVersions.findOne({
         scriptId: new ObjectId(scriptId),
         version,
         isActive: true,
@@ -93,34 +74,20 @@ class ExecutionService {
         throw new Error("❌ Script version not found");
       }
 
-      console.log("✅ Script version found");
-
       /**
-       * ============================================================
-       * 4️⃣ GENERATE SIGNED URL
-       * ============================================================
+       * 4️⃣ SIGNED URL (IMPORTANT: s3Key)
        */
-      const scriptUrl = await getSignedFileUrl(
-        scriptVersion.storageKey
-      );
-
-      console.log("🔐 Signed URL generated");
+      const scriptUrl = await getSignedFileUrl(scriptVersion.s3Key);
 
       /**
-       * ============================================================
        * 5️⃣ TRIGGER K8s JOB
-       * ============================================================
        */
       await createJob(processId, scriptUrl, input);
 
-      console.log("🚀 K8s job triggered");
-
       /**
-       * ============================================================
-       * 6️⃣ UPDATE STATUS → RUNNING
-       * ============================================================
+       * 6️⃣ UPDATE STATUS
        */
-      await executionsCollection.updateOne(
+      await executions.updateOne(
         { _id: executionId },
         {
           $set: {
@@ -131,28 +98,17 @@ class ExecutionService {
         }
       );
 
-      console.log("🔥 Execution running:", processId);
-
-      /**
-       * ============================================================
-       * 7️⃣ RETURN RESPONSE
-       * ============================================================
-       */
       return {
         _id: executionId,
         processId,
         status: "RUNNING",
       };
-
     } catch (err) {
       console.error("❌ ExecutionService Error:", err.message);
       throw err;
     }
   }
 
-  /**
-   * 📄 GET EXECUTION BY ID
-   */
   async getExecution(executionId) {
     const db = getDB();
     return db.collection("executions").findOne({
@@ -160,9 +116,6 @@ class ExecutionService {
     });
   }
 
-  /**
-   * 📋 GET ALL EXECUTIONS
-   */
   async getAllExecutions() {
     const db = getDB();
     return db

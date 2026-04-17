@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * 📦 SCRIPT ROUTES (NATIVE MONGODB VERSION)
+ * 📦 SCRIPT ROUTES (FINAL - TRITON ALIGNED)
  * ============================================================
  */
 
@@ -12,6 +12,7 @@ const upload = multer();
 
 const storage = require("../utils/storage");
 const { getDB } = require("../config/db.config");
+const { ObjectId } = require("mongodb");
 
 const executionService = require("../services/execution.service");
 
@@ -40,19 +41,27 @@ router.post("/upload", upload.single("file"), async (req, res) => {
 
     const db = getDB();
 
-    await db.collection("scriptVersions").insertOne({
-      scriptId,
+    await db.collection("scriptversions").insertOne({
+      scriptId: new ObjectId(scriptId),
       version,
-      storageKey: key,
+
       entrypoint: "main.py",
       inputSchema: {},
+
+      s3Key: key,
+      s3ScriptPath: null,
+
+      changeSummary: "Initial upload",
       isActive: true,
-      createdAt: new Date(),
+
+      created: new Date(),
+      createdBy: "system",
+      updatedAt: new Date(),
     });
 
     return res.json({
       message: "Script uploaded successfully",
-      storageKey: key,
+      s3Key: key,
     });
 
   } catch (err) {
