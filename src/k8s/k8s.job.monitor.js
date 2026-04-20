@@ -3,9 +3,10 @@ const { Writable } = require("stream");
 const { getDB } = require("../config/db.config");
 const AWS = require("aws-sdk");
 
-// ===============================
-//  Validate required environment variables
-// ===============================
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled Rejection:", reason);
+});
+
 const requiredEnv = [
   "AWS_REGION",
   "AWS_ACCESS_KEY_ID",
@@ -15,14 +16,11 @@ const requiredEnv = [
 ];
 for (const envVar of requiredEnv) {
   if (!process.env[envVar]) {
-    console.error(`FATAL: Missing required env var: ${envVar}`);
+    console.error(`FATAL: Missing env var: ${envVar}`);
     process.exit(1);
   }
 }
 
-// ===============================
-//  AWS S3 Configuration
-// ===============================
 const s3 = new AWS.S3({
   region: process.env.AWS_REGION,
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
@@ -30,9 +28,6 @@ const s3 = new AWS.S3({
 });
 const BUCKET_NAME = process.env.AWS_S3_BUCKET;
 
-// ===============================
-//  Kubernetes Setup
-// ===============================
 const kc = new k8s.KubeConfig();
 if (process.env.KUBERNETES_SERVICE_HOST) {
   kc.loadFromCluster();
@@ -42,42 +37,139 @@ if (process.env.KUBERNETES_SERVICE_HOST) {
 const watch = new k8s.Watch(kc);
 const NAMESPACE = process.env.K8S_NAMESPACE;
 
-// ===============================
-//  In‑memory state
-// ===============================
 const activeStreams = new Set();
 const completedPods = new Set();
 const logBuffer = {};
 
-// ===============================
-//  Helper: Sanitize S3 keys
-// ===============================
-function sanitizeKey(key) {
-  return key.replace(/\/+/g, "/");
-}
+// Record the exact moment this monitor starts
+const MONITOR_START_TIME = new Date();
 
-// ===============================
-//  Upload to S3
-// ===============================
-async function uploadToS3(key, buffer, contentType = "text/plain") {
-  if (!BUCKET_NAME) {
-    throw new Error("AWS_S3_BUCKET is not defined");
+async function waitForS3Object(key, maxWaitSec = 30, intervalSec = 2) {
+  const start = Date.now();
+  while ((Date.now() - start) / 1000 < maxWaitSec) {
+    try {
+      await s3.headObject({ Bucket: BUCKET_NAME, Key: key }).promise();
+      return true;
+    } catch (err) {
+      if (err.code !== "NotFound") throw err;
+      await new Promise((r) => setTimeout(r, intervalSec * 1000));
+    }
   }
-  const params = {
-    Bucket: BUCKET_NAME,
-    Key: key,
-    Body: buffer,
-    ContentType: contentType,
-  };
-  await s3.putObject(params).promise();
-  return key;
+  return false;
 }
 
-// ===============================
-//  Start watching pods
-// ===============================
+function buildMinimalLogsFromString(rawContent) {
+  const cleanedContent = rawContent.replace(/OUTPUT_JSON_START[\s\S]*?OUTPUT_JSON_END/g, '');
+  const lines = cleanedContent.split(/\r?\n/);
+  const minimal = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (
+      trimmed.includes("% Total") || trimmed.includes("Dload") || trimmed.includes("Upload") ||
+      trimmed.includes("Archive:") || trimmed.includes("extracting:") || trimmed.includes("inflating:") ||
+      trimmed.includes("Collecting ") || trimmed.includes("Downloading ") ||
+      trimmed.includes("Installing collected packages") || trimmed.includes("Successfully installed") ||
+      trimmed.includes("WARNING: Running pip") || trimmed.includes("[notice] A new release of pip") ||
+      trimmed.includes("[notice] To update, run") || trimmed.includes("📁 Final shared contents:") ||
+      trimmed === "/shared:" || trimmed.startsWith("logs.txt") || trimmed.startsWith("metadata.json") ||
+      trimmed.startsWith("output.json") || trimmed.includes("Requirement already satisfied") ||
+      trimmed.match(/^\d+\s+\d+\s+\d+/)
+    ) {
+      continue;
+    }
+    const withoutTimestamp = line.replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+/, "");
+    minimal.push(withoutTimestamp);
+  }
+  return minimal.slice(-30);
+}
+
+function extractScriptError(logsContent) {
+  if (!logsContent) return null;
+  const lines = logsContent.split(/\r?\n/);
+  const errorLines = [];
+  for (const line of lines) {
+    if (line.includes("Error") || line.includes("Exception") || line.includes("Traceback") ||
+        line.includes("404") || line.includes("failed") || line.includes("curl") ||
+        line.includes("❌") || line.includes("SCRIPT_") || line.includes("UNZIP_FAILED") ||
+        line.includes("ModuleNotFoundError") || line.includes("SyntaxError") ||
+        line.includes("FileNotFoundError") || line.includes("ConnectionError")) {
+      errorLines.push(line.trim());
+      if (errorLines.length >= 5) break;
+    }
+  }
+  return errorLines.length ? errorLines.join("\n") : null;
+}
+
+function categorizeFailure(podTerminationReason, podExitMessage, scriptError, exitCode) {
+  if (podTerminationReason === "OOMKilled") {
+    return { errorCode: "POD_OOM_KILLED", errorMessage: "Container ran out of memory. Increase memory limits." };
+  }
+  if (podTerminationReason === "Evicted") {
+    return { errorCode: "POD_EVICTED", errorMessage: "Pod evicted due to node pressure." };
+  }
+  if (scriptError && scriptError.includes("SCRIPT_DOWNLOAD_FAILED")) {
+    return { errorCode: "DOWNLOAD_FAILED", errorMessage: "Could not download script.zip. Check S3 key, bucket permissions, or signed URL expiry." };
+  }
+  if (scriptError && scriptError.includes("UNZIP_FAILED")) {
+    return { errorCode: "UNZIP_FAILED", errorMessage: "ZIP extraction failed. Ensure archive is not corrupt and contains valid files." };
+  }
+  if (scriptError && scriptError.includes("ModuleNotFoundError")) {
+    const match = scriptError.match(/ModuleNotFoundError: No module named '(\w+)'/);
+    const module = match ? match[1] : "unknown";
+    return { errorCode: "MISSING_DEPENDENCY", errorMessage: `Python module '${module}' not found. Add '${module}' to requirements.txt.` };
+  }
+  if (scriptError && (scriptError.includes("SyntaxError") || scriptError.includes("IndentationError"))) {
+    return { errorCode: "SYNTAX_ERROR", errorMessage: "Script contains syntax errors. Check main.py for typos." };
+  }
+  if (scriptError && scriptError.includes("FileNotFoundError")) {
+    return { errorCode: "FILE_NOT_FOUND", errorMessage: "Script tried to open a file that does not exist. Check file paths." };
+  }
+  if (scriptError && scriptError.includes("ConnectionError")) {
+    return { errorCode: "NETWORK_ERROR", errorMessage: "Script failed to connect to external API. Check URL and network connectivity." };
+  }
+  if (exitCode !== 0) {
+    return { errorCode: "SCRIPT_FAILURE", errorMessage: scriptError || "Script failed with non-zero exit code. See logs for details." };
+  }
+  return { errorCode: null, errorMessage: null };
+}
+
+async function fetchPodLogsFromAPI(podName) {
+  try {
+    const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
+    const logStream = await k8sApi.readNamespacedPodLog(
+      podName,
+      NAMESPACE,
+      "runner",
+      undefined, undefined, undefined, undefined, undefined
+    );
+    return logStream.body || "";
+  } catch (err) {
+    console.error(`Failed to fetch pod logs from API for ${podName}:`, err.message);
+    return null;
+  }
+}
+
+async function streamLogs(podName) {
+  const log = new k8s.Log(kc);
+  logBuffer[podName] = [];
+  const writable = new Writable({
+    write(chunk, enc, cb) {
+      const line = chunk.toString();
+      logBuffer[podName].push(line);
+      process.stdout.write(line);
+      cb();
+    },
+  });
+  try {
+    await log.log(NAMESPACE, podName, "runner", writable, { follow: true, timestamps: true });
+  } catch (err) {
+    // ignore – pod may have terminated
+  }
+}
+
 function startRealTimeMonitor() {
-  console.log("Kubernetes real-time monitor started");
+  console.log("📡 Kubernetes monitor started");
 
   watch.watch(
     `/api/v1/namespaces/${NAMESPACE}/pods`,
@@ -86,24 +178,27 @@ function startRealTimeMonitor() {
       try {
         const podName = pod.metadata?.name;
         const jobName = pod.metadata?.labels?.job;
-
         if (!podName || !jobName) return;
-        if (!jobName.startsWith("gsd-py-runner-job-")) return;
+        if (!jobName.startsWith("gsd")) return;
 
-        const isRunning = pod.status?.containerStatuses?.[0]?.state?.running;
-        if (isRunning && !activeStreams.has(podName)) {
-          activeStreams.add(podName);
-          streamPodLogs(podName);
+        // Skip pods that were created before this monitor started
+        const creationTimestamp = pod.metadata?.creationTimestamp;
+        if (creationTimestamp && new Date(creationTimestamp) < MONITOR_START_TIME) {
+          // Pod created before monitor start – ignore completely
+          return;
         }
 
-        const terminated = pod.status?.containerStatuses?.[0]?.state?.terminated;
-        if (terminated && !completedPods.has(podName)) {
+        const phase = pod.status?.phase;
+        const isTerminated = pod.status?.containerStatuses?.[0]?.state?.terminated;
+
+        if (!isTerminated && phase !== "Succeeded" && phase !== "Failed" && !activeStreams.has(podName)) {
+          activeStreams.add(podName);
+          streamLogs(podName).catch(err => console.error(`Live log stream error for ${podName}:`, err.message));
+        }
+
+        if (isTerminated && !completedPods.has(podName)) {
           completedPods.add(podName);
-          await handleCompletion(
-            podName,
-            jobName,
-            terminated.exitCode === 0 ? "Succeeded" : "Failed"
-          );
+          await handleCompletion(podName, jobName, isTerminated.exitCode);
         }
       } catch (err) {
         console.error("Watch error:", err.message);
@@ -116,278 +211,111 @@ function startRealTimeMonitor() {
   );
 }
 
-// ===============================
-//  Stream logs in real time
-// ===============================
-function streamPodLogs(podName) {
-  const log = new k8s.Log(kc);
-  logBuffer[podName] = [];
-
-  const writable = new Writable({
-    write(chunk, encoding, callback) {
-      const line = chunk.toString();
-      logBuffer[podName].push(line);
-      process.stdout.write(line);
-      callback();
-    },
-  });
-
-  log.log(
-    NAMESPACE,
-    podName,
-    "runner",
-    writable,
-    { follow: true, timestamps: true },
-    () => {}
-  );
-}
-
-// ===============================
-//  Get collected logs for a pod
-// ===============================
-function getLogs(podName) {
-  return logBuffer[podName] || [];
-}
-
-// ===============================
-//  Minimal logs for MongoDB (keep timestamps, only important lines)
-// ===============================
-function buildMinimalLogs(rawLogs) {
-  const minimal = [];
-
-  for (const line of rawLogs) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    // Skip known noise lines
-    if (
-      trimmed.includes("% Total") ||
-      trimmed.includes("Dload") ||
-      trimmed.includes("Upload") ||
-      trimmed.includes("OUTPUT_JSON_START") ||
-      trimmed.includes("OUTPUT_JSON_END") ||
-      trimmed.includes("Archive:") ||
-      trimmed.includes("inflating:") ||
-      trimmed.includes("extracting:") ||
-      trimmed.includes("Requirement already satisfied") ||
-      trimmed.includes("WARNING: Running pip as") ||
-      trimmed.includes("[notice] A new release of pip") ||
-      trimmed.includes("[notice] To update, run")
-    ) {
-      continue;
-    }
-
-    // Extract timestamp and message (first space separates them)
-    const firstSpace = trimmed.indexOf(" ");
-    let ts = "";
-    let msg = trimmed;
-    if (firstSpace > 0) {
-      ts = trimmed.substring(0, firstSpace);
-      msg = trimmed.substring(firstSpace + 1);
-    }
-
-    // Keep lines that are important for execution visibility
-    const isImportant =
-      msg.includes("🚀") ||
-      msg.includes("✅") ||
-      msg.includes("▶️") ||
-      msg.includes("📥") ||
-      msg.includes("📦") ||
-      msg.includes("🏢") ||
-      msg.includes("🌐") ||
-      msg.includes("📊") ||
-      msg.includes("⚙️") ||
-      msg.includes("Script started") ||
-      msg.includes("Script completed") ||
-      msg.includes("Running script...") ||
-      msg.includes("DONE") ||
-      msg.includes("ERROR") ||
-      msg.includes("Exception") ||
-      msg.includes("Traceback") ||
-      msg.includes("FAILED") ||
-      // Keep actual JSON output lines (they contain "outputs")
-      (msg.includes('"outputs"') && msg.includes("{") && msg.includes("}"));
-
-    if (isImportant) {
-      minimal.push(`[${ts}] ${msg}`);
-    }
-  }
-
-  return minimal.slice(-30);
-}
-
-// ===============================
-//  Extract JSON output – strips timestamps only for parsing
-// ===============================
-function extractOutput(logs) {
-  try {
-    const startIdx = logs.findIndex((l) => l.includes("OUTPUT_JSON_START"));
-    const endIdx = logs.findIndex((l) => l.includes("OUTPUT_JSON_END"));
-    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) return null;
-
-    // Extract lines between markers
-    const blockLines = logs.slice(startIdx + 1, endIdx);
-
-    // Remove Kubernetes timestamp prefix from each line (for parsing only)
-    // Pattern matches: 2026-04-16T14:41:17.200151160Z (followed by space)
-    const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+/;
-    const cleanedLines = blockLines.map((line) =>
-      line.replace(timestampPattern, "").trim()
-    );
-
-    const rawBlock = cleanedLines.join("\n").trim();
-    // Remove ANSI escape codes
-    const cleanBlock = rawBlock.replace(/\u001b\[.*?m/g, "");
-
-    // Find the first '{' and matching '}'
-    const firstBrace = cleanBlock.indexOf("{");
-    let lastBrace = -1;
-    let braceCount = 0;
-    for (let i = firstBrace; i < cleanBlock.length; i++) {
-      if (cleanBlock[i] === "{") braceCount++;
-      if (cleanBlock[i] === "}") {
-        braceCount--;
-        if (braceCount === 0) {
-          lastBrace = i;
-          break;
-        }
-      }
-    }
-    if (firstBrace === -1 || lastBrace === -1) return null;
-
-    const jsonString = cleanBlock.slice(firstBrace, lastBrace + 1);
-    return JSON.parse(jsonString);
-  } catch (err) {
-    console.error("Output parse failed:", err.message);
-    return null;
-  }
-}
-
-// ===============================
-//  Idempotent completion handler with enhanced error logging
-// ===============================
-async function handleCompletion(podName, jobName, phase) {
+async function handleCompletion(podName, jobName, exitCode) {
   try {
     const db = getDB();
     const executions = db.collection("executions");
-
-    // Idempotency check
-    const existing = await executions.findOne({ processId: jobName });
-    if (existing?.logsStorageKey) {
-      console.log(`Execution ${jobName} already processed. Skipping.`);
-      return;
-    }
-
-    // Get pod details for better error context
     const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
+
     let podTerminationReason = null;
     let podExitMessage = null;
-    try {
-      const pod = await k8sApi.readNamespacedPod(podName, NAMESPACE);
-      const containerStatus = pod.body.status?.containerStatuses?.[0];
-      if (containerStatus?.state?.terminated) {
-        podTerminationReason = containerStatus.state.terminated.reason;
-        podExitMessage = containerStatus.state.terminated.message;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const pod = await k8sApi.readNamespacedPod(podName, NAMESPACE);
+        const containerStatus = pod.body.status?.containerStatuses?.[0];
+        if (containerStatus?.state?.terminated) {
+          podTerminationReason = containerStatus.state.terminated.reason;
+          podExitMessage = containerStatus.state.terminated.message;
+          break;
+        }
+      } catch (err) {
+        console.warn(`Could not fetch pod details (attempt ${attempt+1}):`, err.message);
       }
-    } catch (err) {
-      console.warn(`Could not fetch pod details: ${err.message}`);
+      await new Promise(r => setTimeout(r, 2000));
     }
+    console.log(`Pod termination reason: ${podTerminationReason || "N/A"}`);
+    if (podExitMessage) console.log(`Pod exit message: ${podExitMessage}`);
 
-    // Update status and finishedAt
-    const finalStatus = phase === "Succeeded" ? "SUCCESS" : "FAILED";
+    const finalStatus = exitCode === 0 ? "SUCCESS" : "FAILED";
     await executions.updateOne(
       { processId: jobName },
       {
         $set: {
           status: finalStatus,
           finishedAt: new Date(),
-          ...(podTerminationReason && { podTerminationReason }),
-          ...(podExitMessage && { podExitMessage }),
-        },
-      }
-    );
-
-    // Wait for logs to flush
-    await new Promise((res) => setTimeout(res, 1500));
-
-    const rawLogs = getLogs(podName).filter(Boolean);
-
-    // ===============================
-    //  CORRECT S3 PATHS (full logs)
-    // ===============================
-    const basePath = `outputs/executions/${jobName}`;
-    const logsKey = sanitizeKey(`${basePath}/logs.txt`);
-    const outputKey = sanitizeKey(`${basePath}/output.json`);
-
-    // Upload full raw logs to S3
-    const fullLogsBuffer = Buffer.from(rawLogs.join("\n"));
-    await uploadToS3(logsKey, fullLogsBuffer, "text/plain");
-    console.log(`📦 Full logs uploaded to s3://${BUCKET_NAME}/${logsKey}`);
-
-    // Extract output JSON with better error logging
-    let finalOutputKey = null;
-    let outputExtractError = null;
-    const output = extractOutput(rawLogs);
-
-    if (output) {
-      const outputBuffer = Buffer.from(JSON.stringify(output, null, 2));
-      await uploadToS3(outputKey, outputBuffer, "application/json");
-      finalOutputKey = outputKey;
-      console.log(`📦 Output JSON uploaded to s3://${BUCKET_NAME}/${outputKey}`);
-    } else {
-      // Determine why extraction failed
-      const hasStart = rawLogs.some((l) => l.includes("OUTPUT_JSON_START"));
-      const hasEnd = rawLogs.some((l) => l.includes("OUTPUT_JSON_END"));
-      if (!hasStart || !hasEnd) {
-        outputExtractError = "Script did not output OUTPUT_JSON_START/END markers";
-      } else {
-        outputExtractError = "JSON parsing failed – check if the script printed valid JSON between markers";
-      }
-      console.warn(`⚠️ Output extraction failed for ${jobName}: ${outputExtractError}`);
-    }
-
-    // ===============================
-    //  Minimal logs for MongoDB (keep timestamps)
-    // ===============================
-    const minimalLogs = buildMinimalLogs(rawLogs);
-
-    // If the pod failed, append termination reason and extraction errors to logs
-    const finalLogs = [...minimalLogs];
-    if (finalStatus === "FAILED") {
-      if (podTerminationReason) {
-        finalLogs.push(
-          `[SYSTEM] Pod terminated: ${podTerminationReason}${podExitMessage ? ` - ${podExitMessage}` : ""}`
-        );
-      }
-      if (outputExtractError) {
-        finalLogs.push(`[SYSTEM] Output extraction issue: ${outputExtractError}`);
-      }
-    }
-
-    // Update MongoDB with minimal logs and S3 keys
-    await executions.updateOne(
-      { processId: jobName },
-      {
-        $set: {
-          logs: finalLogs,
-          logsStorageKey: logsKey,
-          outputStorageKey: finalOutputKey,
           updatedAt: new Date(),
-          ...(outputExtractError && { outputExtractError }),
+          podTerminationReason,
+          podExitMessage,
         },
       }
     );
 
-    // Clean up memory
+    const basePath = `outputs/executions/${jobName}`;
+    let logsContent = null;
+    let finalLogsKey = null;
+
+    const logsKey = `${basePath}/logs.txt`;
+    const logsExist = await waitForS3Object(logsKey, 30, 3);
+    if (logsExist) {
+      const s3Object = await s3.getObject({ Bucket: BUCKET_NAME, Key: logsKey }).promise();
+      logsContent = s3Object.Body.toString("utf-8");
+      finalLogsKey = logsKey;
+      console.log(`✅ Logs retrieved from S3: ${logsKey}`);
+    } else if (logBuffer[podName] && logBuffer[podName].length > 0) {
+      logsContent = logBuffer[podName].join("\n");
+      const fallbackKey = `${basePath}/logs-fallback.txt`;
+      await s3.putObject({ Bucket: BUCKET_NAME, Key: fallbackKey, Body: logsContent, ContentType: "text/plain" }).promise();
+      finalLogsKey = fallbackKey;
+      console.log(`⚠️ Logs from buffer uploaded to ${fallbackKey}`);
+    } else {
+      console.log(`📡 Fetching logs directly from K8s API for ${podName}`);
+      logsContent = await fetchPodLogsFromAPI(podName);
+      if (logsContent) {
+        const apiFallbackKey = `${basePath}/logs-k8s-api-fallback.txt`;
+        await s3.putObject({ Bucket: BUCKET_NAME, Key: apiFallbackKey, Body: logsContent, ContentType: "text/plain" }).promise();
+        finalLogsKey = apiFallbackKey;
+        console.log(`✅ Logs from K8s API uploaded to ${apiFallbackKey}`);
+      } else {
+        console.error(`❌ No logs available for ${jobName} from any source`);
+      }
+    }
+
+    const minimalLogs = logsContent ? buildMinimalLogsFromString(logsContent) : [];
+    const scriptError = logsContent ? extractScriptError(logsContent) : null;
+    const { errorCode, errorMessage } = categorizeFailure(podTerminationReason, podExitMessage, scriptError, exitCode);
+
+    if (finalStatus === "FAILED") {
+      console.log(`❌ Job ${jobName} failed`);
+      if (errorCode) console.log(`   Error code: ${errorCode}`);
+      if (errorMessage) console.log(`   Message: ${errorMessage}`);
+      if (scriptError) console.log(`   Script error: ${scriptError}`);
+    } else {
+      console.log(`✅ Job ${jobName} completed successfully`);
+    }
+
+    let outputExist = false;
+    try {
+      await s3.headObject({ Bucket: BUCKET_NAME, Key: `${basePath}/output.json` }).promise();
+      outputExist = true;
+    } catch (e) {}
+
+    const updateFields = {
+      logsStorageKey: finalLogsKey,
+      outputStorageKey: outputExist ? `${basePath}/output.json` : null,
+      artifactPrefix: `${basePath}/`,
+      logs: minimalLogs,
+      scriptError,
+      errorCode,
+      errorMessage,
+    };
+    await executions.updateOne({ processId: jobName }, { $set: updateFields });
+
     delete logBuffer[podName];
     activeStreams.delete(podName);
-
-    console.log(`✅ Execution completed: ${jobName} (${finalStatus})`);
+    console.log(`✅ Completion handler finished for ${jobName}`);
   } catch (err) {
-    console.error("Completion failed:", err.message);
+    console.error(`Completion error for ${jobName}:`, err.message);
   }
 }
 
-module.exports = {
-  startRealTimeMonitor,
-};
+module.exports = { startRealTimeMonitor };
